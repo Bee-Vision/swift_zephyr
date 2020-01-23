@@ -22,6 +22,10 @@
 #define WAKE_PIN DT_INST_GPIO_PIN(0, wake_gpios)
 #define RESET_PIN DT_INST_GPIO_PIN(0, reset_gpios)
 
+#ifdef CONFIG_DEVICE_POWER_MANAGEMENT
+static int pm_current_state = DEVICE_PM_ACTIVE_STATE;
+#endif
+
 LOG_MODULE_REGISTER(CCS811, CONFIG_SENSOR_LOG_LEVEL);
 
 #if DT_INST_NODE_HAS_PROP(0, wake_gpios)
@@ -371,6 +375,7 @@ static int switch_to_app_mode(const struct device *i2c)
 	return 0;
 }
 
+
 #ifdef CONFIG_CCS811_TRIGGER
 
 int ccs811_mutate_meas_mode(const struct device *dev,
@@ -429,6 +434,77 @@ int ccs811_set_thresholds(const struct device *dev)
 }
 
 #endif /* CONFIG_CCS811_TRIGGER */
+
+#ifdef CONFIG_DEVICE_POWER_MANAGEMENT
+
+int ccs811_set_meas_mode(struct device *dev, u8_t meas_mode)
+{
+	struct ccs811_data *drv_data = dev->driver_data;
+	int ret = 0;
+
+	/* Only allow idle and 1sec mode, other modes have preconditions */
+	if (meas_mode != CCS811_MODE_IAQ_1SEC && meas_mode != CCS811_MODE_IDLE)
+	{
+		return -ENOTSUP;
+	}
+
+	set_wake(drv_data, true);
+	if (i2c_reg_write_byte(drv_data->i2c, DT_INST_0_AMS_CCS811_BASE_ADDRESS,
+			       CCS811_REG_MEAS_MODE,
+			       meas_mode) < 0) {
+		LOG_ERR("Failed to set Measurement mode");
+		ret = -EIO;
+	}
+	set_wake(drv_data, false);
+
+	return ret;
+}
+
+static int ccs811_pm_func( struct device *dev, u32_t ctrl_command, void *context, device_pm_cb cb, void *arg )
+{
+  int err = 0;
+
+  if ( ctrl_command == DEVICE_PM_SET_POWER_STATE )
+  {
+    u32_t pm_new_state = *( (const u32_t *)context );
+
+    if ( pm_new_state != pm_current_state )
+    {
+      switch ( pm_new_state )
+      {
+        case DEVICE_PM_ACTIVE_STATE:
+          err = ccs811_set_meas_mode( dev, CCS811_MODE_IAQ_1SEC );
+          break;
+        case DEVICE_PM_LOW_POWER_STATE:
+          err = ccs811_set_meas_mode( dev, CCS811_MODE_IDLE );
+          break;
+        default:
+          err = -ENOTSUP;
+          break;
+      }
+      if ( err == 0 )
+      {
+        pm_current_state = pm_new_state;
+      }
+    }
+  }
+  else if ( ctrl_command == DEVICE_PM_GET_POWER_STATE )
+  {
+    *( (u32_t *)context ) = pm_current_state;
+  }
+  else
+  {
+    err = -ENOTSUP;
+  }
+
+  if ( cb )
+  {
+    cb( dev, err, context, arg );
+  }
+
+  return err;
+}
+#endif
 
 static int ccs811_init(const struct device *dev)
 {
@@ -500,13 +576,13 @@ static int ccs811_init(const struct device *dev)
 	gpio_pin_set(drv_data->reset_gpio, RESET_PIN, 0);
 #else
 	{
-		static uint8_t const reset_seq[] = {
+		uint8_t reset_seq[] = {
 			0xFF, 0x11, 0xE5, 0x72, 0x8A,
 		};
 
-		if (i2c_write(drv_data->i2c, reset_seq, sizeof(reset_seq),
-			      DT_INST_REG_ADDR(0)) < 0) {
-			LOG_ERR("Failed to issue SW reset");
+		if ((ret = i2c_write(drv_data->i2c, reset_seq, sizeof(reset_seq),
+			      DT_INST_REG_ADDR(0))) < 0) {
+			LOG_ERR("Failed to issue SW reset %d", ret);
 			ret = -EIO;
 			goto out;
 		}
@@ -593,7 +669,14 @@ out:
 
 static struct ccs811_data ccs811_driver;
 
+#ifdef CONFIG_DEVICE_POWER_MANAGEMENT
+DEVICE_DT_INST_DEFINE(0, ccs811_init, ccs811_pm_func,
+		 &ccs811_driver, NULL,
+		 POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY,
+		 &ccs811_driver_api);
+#else
 DEVICE_DT_INST_DEFINE(0, ccs811_init, device_pm_control_nop,
 		 &ccs811_driver, NULL,
 		 POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY,
 		 &ccs811_driver_api);
+#endif
