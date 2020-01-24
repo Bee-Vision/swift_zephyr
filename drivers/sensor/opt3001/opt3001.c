@@ -14,6 +14,10 @@
 
 #include "opt3001.h"
 
+#ifdef CONFIG_DEVICE_POWER_MANAGEMENT
+static int pm_current_state = DEVICE_PM_ACTIVE_STATE;
+#endif
+
 LOG_MODULE_REGISTER(opt3001, CONFIG_SENSOR_LOG_LEVEL);
 
 static int opt3001_reg_read(struct opt3001_data *drv_data, uint8_t reg,
@@ -107,6 +111,68 @@ static int opt3001_channel_get(const struct device *dev,
 	return 0;
 }
 
+
+
+#ifdef CONFIG_DEVICE_POWER_MANAGEMENT
+
+static int opt3001_set_mode(struct device * dev, u16_t mode) 
+{
+	struct opt3001_data *drv_data = dev->driver_data;
+	if (opt3001_reg_update(drv_data, OPT3001_REG_CONFIG,
+			       OPT3001_CONVERSION_MODE_MASK,
+			       mode) != 0) {
+		LOG_ERR("Failed to set OP3001 Mode");
+		return -EIO;
+	}
+	return 0;
+}
+
+static int opt3001_pm_func( struct device *dev, u32_t ctrl_command, void *context, device_pm_cb cb, void *arg )
+{
+  int err = 0;
+
+  if ( ctrl_command == DEVICE_PM_SET_POWER_STATE )
+  {
+    u32_t pm_new_state = *( (const u32_t *)context );
+
+    if ( pm_new_state != pm_current_state )
+    {
+      switch ( pm_new_state )
+      {
+        case DEVICE_PM_ACTIVE_STATE:
+          err = opt3001_set_mode( dev, OPT3001_CONVERSION_MODE_CONTINUOUS );
+          break;
+        case DEVICE_PM_LOW_POWER_STATE:
+          err = opt3001_set_mode( dev, OPT3001_CONVERSION_MODE_SHUTDOWN );
+          break;
+        default:
+          err = -ENOTSUP;
+          break;
+      }
+      if ( err == 0 )
+      {
+        pm_current_state = pm_new_state;
+      }
+    }
+  }
+  else if ( ctrl_command == DEVICE_PM_GET_POWER_STATE )
+  {
+    *( (u32_t *)context ) = pm_current_state;
+  }
+  else
+  {
+    err = -ENOTSUP;
+  }
+
+  if ( cb )
+  {
+    cb( dev, err, context, arg );
+  }
+
+  return err;
+}
+#endif
+
 static const struct sensor_driver_api opt3001_driver_api = {
 	.sample_fetch = opt3001_sample_fetch,
 	.channel_get = opt3001_channel_get,
@@ -165,6 +231,15 @@ int opt3001_init(const struct device *dev)
 
 static struct opt3001_data opt3001_drv_data;
 
+#ifdef CONFIG_DEVICE_POWER_MANAGEMENT
+
+DEVICE_DT_INST_DEFINE(0, opt3001_init, device_pm_func,
+		    &opt3001_drv_data, NULL, POST_KERNEL,
+		    CONFIG_SENSOR_INIT_PRIORITY, &opt3001_driver_api);
+#else
+DEVICE_AND_API_INIT(opt3001, DT_INST_0_TI_OPT3001_LABEL, opt3001_init,
+>>>>>>> 9958e3aaaf... Added OPT3001 Power Management
 DEVICE_DT_INST_DEFINE(0, opt3001_init, device_pm_control_nop,
 		    &opt3001_drv_data, NULL, POST_KERNEL,
 		    CONFIG_SENSOR_INIT_PRIORITY, &opt3001_driver_api);
+#endif
