@@ -6,6 +6,7 @@
 
 #define DT_DRV_COMPAT quectel_bg9x
 
+#include <string.h>
 #include <logging/log.h>
 LOG_MODULE_REGISTER(modem_quectel_bg9x, CONFIG_MODEM_LOG_LEVEL);
 
@@ -407,8 +408,11 @@ MODEM_CMD_DEFINE(on_cmd_unsol_recv)
 {
 	struct modem_socket *sock;
 	int		     sock_fd;
+	int		     new_total;
+	int		     ret;
 
 	sock_fd = ATOI(argv[0], 0, "sock_fd");
+	new_total = ATOI(argv[1], 0, "recv_len");
 
 	/* Socket pointer from FD. */
 	sock = modem_socket_from_fd(&mdata.socket_config, sock_fd);
@@ -416,9 +420,17 @@ MODEM_CMD_DEFINE(on_cmd_unsol_recv)
 		return 0;
 	}
 
-	/* Data ready indication. */
-	LOG_INF("Data Receive Indication for socket: %d", sock_fd);
-	modem_socket_data_ready(&mdata.socket_config, sock);
+	ret = modem_socket_packet_size_update(&mdata.socket_config, sock,
+		new_total);
+	if (ret < 0) {
+		LOG_ERR("socket_id:%d left_bytes:%d err: %d", sock_fd, new_total, ret);
+	}
+
+	if (new_total > 0) {
+		/* Data ready indication. */
+		LOG_INF("Data Receive Indication for socket: %d", sock_fd);
+		modem_socket_data_ready(&mdata.socket_config, sock);
+	}
 
 	return 0;
 }
@@ -443,6 +455,158 @@ MODEM_CMD_DEFINE(on_cmd_unsol_close)
 	return 0;
 }
 
+#if defined(CONFIG_DNS_RESOLVER)
+
+#define MDM_DNS_TIMEOUT                        K_SECONDS(60)
+
+static struct zsock_addrinfo result;
+static struct sockaddr result_addr;
+static char result_canonname[DNS_MAX_NAME_SIZE + 1];
+K_SEM_DEFINE(dns_gip,0,1)
+
+/* Handler: DNS Get IP Indication.
+
+ There are 2 types of messages to be handled by this handler
+
+ Type 1: +QIURC: "dnsgip",<err>,<IP_count>,<DNS_ttl>
+       example: +QIURC: "dnsgip",0,1,299
+
+ Type 2: +QIURC: "dnsgip",<hostIPaddr>]
+       example: +QIURC: "dnsgip","142.250.73.227"
+
+ */
+MODEM_CMD_DEFINE(on_cmd_unsol_dnsgip)
+{
+       /* Assume first arg is IP address if it contains '.'' */
+       char * sptr = strchr(argv[0], '.');
+       if (sptr == NULL)
+       {
+               /* Not IP addr */
+               int dnsgip_err = ATOI(argv[0], 0, "dnsgip_err");
+
+               if (dnsgip_err != 0)
+               {
+                       /* DNS Error, Give the semaphore */
+                       modem_cmd_handler_set_error(data, -EIO);
+                       k_sem_give(&dns_gip);
+               }
+       }
+       else
+       {
+               /* ARGV[0] is IP addr */
+
+               /* chop off end quote */
+               argv[0][strlen(argv[0]) - 1] = '\0';
+
+               /* IPv4 Only */
+               result_addr.sa_family = AF_INET;
+               //skip beginning quote when parsing
+               (void)net_addr_pton(result.ai_family, &argv[0][1],
+                               &((struct sockaddr_in *)&result_addr)->sin_addr);
+
+               modem_cmd_handler_set_error(data, 0);
+               k_sem_give(&dns_gip);
+       }
+
+       return 0;
+}
+
+/* TODO: This is a bare-bones implementation of DNS handling
+ * We ignore most of the hints like ai_family, ai_protocol and ai_socktype.
+ * Later, we can add additional handling if it makes sense.
+ */
+static int offload_getaddrinfo(const char *node, const char *service,
+                              const struct zsock_addrinfo *hints,
+                              struct zsock_addrinfo **res)
+{
+       //struct modem_cmd cmd = MODEM_CMD("+UDNSRN: ", on_cmd_dns, 1U, ",");
+       uint32_t port = 0U;
+       int ret;
+       /* DNS command + 128 bytes for domain name parameter */
+       char sendbuf[sizeof("AT+QIDNSGIP=#,\r\n") + 128];
+
+       /* init result */
+       (void)memset(&result, 0, sizeof(result));
+       (void)memset(&result_addr, 0, sizeof(result_addr));
+       /* FIXME: Hard-code DNS to return only IPv4 */
+       result.ai_family = AF_INET;
+       result_addr.sa_family = AF_INET;
+       result.ai_addr = &result_addr;
+       result.ai_addrlen = sizeof(result_addr);
+       result.ai_canonname = result_canonname;
+       result_canonname[0] = '\0';
+
+       if (service) {
+               port = ATOI(service, 0U, "port");
+               if (port < 1 || port > USHRT_MAX) {
+                       return DNS_EAI_SERVICE;
+               }
+       }
+
+       if (port > 0U) {
+               /* FIXME: DNS is hard-coded to return only IPv4 */
+               if (result.ai_family == AF_INET) {
+                       net_sin(&result_addr)->sin_port = htons(port);
+               }
+       }
+
+       /* check to see if node is an IP address */
+       if (net_addr_pton(result.ai_family, node,
+                         &((struct sockaddr_in *)&result_addr)->sin_addr)
+           == 0) {
+               *res = &result;
+               return 0;
+       }
+
+       /* user flagged node as numeric host, but we failed net_addr_pton */
+       if (hints && hints->ai_flags & AI_NUMERICHOST) {
+               return DNS_EAI_NONAME;
+       }
+
+       k_sem_reset(&dns_gip);
+
+       snprintk(sendbuf, sizeof(sendbuf), "AT+QIDNSGIP=1,\"%s\"", node);
+       ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+                            NULL, 0U, sendbuf, NULL, K_NO_WAIT);
+       if (ret < 0) {
+               return ret;
+       }
+
+       /* Wait for the unsolicited modem response */
+       ret = k_sem_take(&dns_gip, MDM_DNS_TIMEOUT);
+       if (ret == EAGAIN)
+       {
+               /*timed out */
+               return DNS_EAI_FAIL;
+       }
+
+       if ((ret = modem_cmd_handler_get_error(&mdata.cmd_handler_data)) == -EIO)
+       {
+               return DNS_EAI_FAIL;
+       }
+
+       LOG_DBG("DNS RESULT: %s",
+               log_strdup(net_addr_ntop(result.ai_family,
+                                        &net_sin(&result_addr)->sin_addr,
+                                        sendbuf, NET_IPV4_ADDR_LEN)));
+
+       *res = (struct zsock_addrinfo *)&result;
+       return 0;
+}
+
+static void offload_freeaddrinfo(struct zsock_addrinfo *res)
+{
+       /* using static result from offload_getaddrinfo() -- no need to free */
+       res = NULL;
+}
+
+const struct socket_dns_offload offload_dns_ops = {
+       .getaddrinfo = offload_getaddrinfo,
+       .freeaddrinfo = offload_freeaddrinfo,
+};
+
+#endif
+
 /* Func: send_socket_data
  * Desc: This function will send "binary" data over the socket object.
  */
@@ -455,7 +619,6 @@ static ssize_t send_socket_data(struct modem_socket *sock,
 {
 	int  ret;
 	char send_buf[sizeof("AT+QISEND=##,####")] = {0};
-	char ctrlz = 0x1A;
 
 	if (buf_len > MDM_MAX_DATA_LENGTH) {
 		buf_len = MDM_MAX_DATA_LENGTH;
@@ -492,9 +655,8 @@ static ssize_t send_socket_data(struct modem_socket *sock,
 		goto exit;
 	}
 
-	/* Write all data on the console and send CTRL+Z. */
+	/* Write all data on the console */
 	mctx.iface.write(&mctx.iface, buf, buf_len);
-	mctx.iface.write(&mctx.iface, &ctrlz, 1);
 
 	/* Wait for 'SEND OK' or 'SEND FAIL' */
 	k_sem_reset(&mdata.sem_response);
@@ -939,8 +1101,11 @@ static const struct modem_cmd response_cmds[] = {
 };
 
 static const struct modem_cmd unsol_cmds[] = {
-	MODEM_CMD("+QIURC: \"recv\",",	   on_cmd_unsol_recv,  1U, ""),
+	MODEM_CMD("+QIURC: \"recv\",",	   on_cmd_unsol_recv,  2U, ","),
 	MODEM_CMD("+QIURC: \"closed\",",   on_cmd_unsol_close, 1U, ""),
+#if defined(CONFIG_DNS_RESOLVER)
+       MODEM_CMD("+QIURC: \"dnsgip\",",   on_cmd_unsol_dnsgip, 1U, ","),
+#endif
 };
 
 /* Commands sent to the modem to set it up at boot time. */
@@ -958,7 +1123,8 @@ static const struct setup_cmd setup_cmds[] = {
 	SETUP_CMD("AT+CIMI", "", on_cmd_atcmdinfo_imsi, 0U, ""),
 	SETUP_CMD("AT+QCCID", "", on_cmd_atcmdinfo_iccid, 0U, ""),
 #endif /* #if defined(CONFIG_MODEM_SIM_NUMBERS) */
-	SETUP_CMD_NOHANDLE("AT+QICSGP=1,1,\"" MDM_APN "\",\"" MDM_USERNAME "\", \"" MDM_PASSWORD "\",1"),
+	SETUP_CMD_NOHANDLE("AT+QICFG =\"recvind\",1"),
+	SETUP_CMD_NOHANDLE("AT+QICSGP=1,1,\"" MDM_APN "\",\"" MDM_USERNAME "\",\"" MDM_PASSWORD "\",0"),
 };
 
 /* Func: modem_pdp_context_active
@@ -1112,6 +1278,10 @@ static void modem_net_iface_init(struct net_if *iface)
 			     sizeof(data->mac_addr),
 			     NET_LINK_ETHERNET);
 	data->net_iface = iface;
+
+#ifdef CONFIG_DNS_RESOLVER
+	socket_offload_dns_register(&offload_dns_ops);
+#endif
 }
 
 static struct net_if_api api_funcs = {
