@@ -213,10 +213,10 @@ exit:
  */
 static void socket_close(struct modem_socket *sock)
 {
-	char buf[sizeof("AT+QICLOSE=##")] = {0};
+	char buf[sizeof("AT+QICLOSE=##,#####")] = {0};
 	int  ret;
 
-	snprintk(buf, sizeof(buf), "AT+QICLOSE=%d", sock->sock_fd);
+	snprintk(buf, sizeof(buf), "AT+QICLOSE=%d,0", sock->sock_fd);
 
 	/* Tell the modem to close the socket. */
 	ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
