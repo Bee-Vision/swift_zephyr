@@ -1064,6 +1064,29 @@ static void modem_rssi_query_work(struct k_work *work)
 	}
 }
 
+/* Func: reset
+ * Desc: Reset the Modem.
+ */
+static void modem_reset(void)
+{
+    /* Power/Reset */
+    /* NOTE: Per the BG95 document, the Reset pin is internally connected to the
+     * Power key pin. */
+
+    /* VBAT needs to have been stable for not >= MDM_RESET_MIN_VBAT_TIME
+     * NOTE: Does not account for stability prior to this point. */
+    k_sleep(MDM_RESET_MIN_VBAT_TIME);
+
+    /* Reset active asserted for MDM_RESET_N_ACTIVE_TIME */
+    modem_pin_write(&mctx, MDM_RESET, 1);
+    k_sleep(MDM_RESET_ACTIVE_TIME);
+
+    /* UART is not in an active state until MDM_RESET_N_UART_INACTIVE_TIME time
+     * has elapsed since MDM_RESET_N was cleared. */
+    modem_pin_write(&mctx, MDM_RESET, 0);
+    k_sleep(MDM_RESET_UART_INACTIVE_TIME);
+}
+
 /* Func: pin_init
  * Desc: Boot up the Modem.
  */
@@ -1077,20 +1100,7 @@ static void pin_init(void)
 	k_sleep(K_MSEC(250));
 #endif
 
-	/* NOTE: Per the BG95 document, the Reset pin is internally connected to the
-	 * Power key pin.
-	 */
-
-	/* MDM_POWER -> 1 for 500-1000 msec. */
-	modem_pin_write(&mctx, MDM_POWER, 1);
-	k_sleep(K_MSEC(750));
-
-	/* MDM_POWER -> 0 and wait for ~2secs as UART remains in "inactive" state
-	 * for some time after the power signal is enabled.
-	 */
-	modem_pin_write(&mctx, MDM_POWER, 0);
-	k_sleep(K_SECONDS(2));
-
+	modem_reset();
 	LOG_INF("... Done!");
 }
 

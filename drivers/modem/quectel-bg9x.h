@@ -56,6 +56,11 @@
 #define MDM_USERNAME			  CONFIG_MODEM_QUECTEL_BG9X_USERNAME
 #define MDM_PASSWORD			  CONFIG_MODEM_QUECTEL_BG9X_PASSWORD
 
+/* Hardware timings - Quectel_BG95_Hardware_Design_V1.1.pdf */
+#define MDM_RESET_MIN_VBAT_TIME   K_MSEC(30)
+#define MDM_RESET_ACTIVE_TIME     K_MSEC(2000)
+#define MDM_RESET_UART_INACTIVE_TIME K_MSEC(2500 - 2000) /* Relative to reset assert */
+
 /* Modem ATOI routine. */
 #define ATOI(s_, value_, desc_)	  modem_atoi(s_, value_, desc_, __func__)
 
