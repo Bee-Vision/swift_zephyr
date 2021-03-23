@@ -10,6 +10,7 @@
 #include <logging/log.h>
 LOG_MODULE_REGISTER(modem_quectel_bg9x, CONFIG_MODEM_LOG_LEVEL);
 
+#include "modem_int.h"
 #include "quectel-bg9x.h"
 
 static struct k_thread	       modem_rx_thread;
@@ -1062,6 +1063,58 @@ static void modem_rssi_query_work(struct k_work *work)
 					       &mdata.rssi_query_work,
 					       K_SECONDS(RSSI_TIMEOUT_SECS));
 	}
+}
+
+static char cclk_result[] = "\"yy/MM/dd,hh:mm:ss-zz\"";
+
+/* Handler: SEND OK */
+MODEM_CMD_DEFINE(on_cmd_atcmd_cclk)
+{
+    modem_cmd_handler_set_error(data, 0);
+    strncpy(cclk_result, argv[0], sizeof(cclk_result)-1);
+    k_sem_give(&mdata.sem_response);
+
+    return 0;
+}
+
+int modem_get_date(struct tm *tm)
+{
+ struct modem_cmd cmd  = MODEM_CMD("+CCLK: ", on_cmd_atcmd_cclk, 1U, "");
+    static char *send_cmd = "AT+CCLK?";
+    int ret;
+
+    /* query modem RSSI */
+    ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+                 &cmd, 1U, send_cmd, &mdata.sem_response,
+                 MDM_CMD_TIMEOUT);
+    if (ret < 0) {
+        LOG_ERR("AT+CCCLK ret:%d", ret);
+    } else {
+        /* Note: Parsing of CCLK response is taken from NCS date_time.c */
+        /* Replace '/' ',' and ':' with whitespace for easier parsing by strtol.
+         * strtol skips over whitespace.
+         */
+        for (int i = 0; i < sizeof(cclk_result); i++) {
+            if (cclk_result[i] == '/' ||
+                    cclk_result[i] == ',' ||
+                    cclk_result[i] == ':') {
+                cclk_result[i] = ' ';
+            }
+        }
+        /* The year starts at index 8. */
+        char *ptr_index = &cclk_result[1];
+        int base = 10;
+        memset(tm, 0, sizeof(*tm));
+
+        tm->tm_year = strtol(ptr_index, &ptr_index, base) + 2000 - 1900;
+        tm->tm_mon = strtol(ptr_index, &ptr_index, base) - 1;
+        tm->tm_mday = strtol(ptr_index, &ptr_index, base);
+        tm->tm_hour = strtol(ptr_index, &ptr_index, base);
+        tm->tm_min = strtol(ptr_index, &ptr_index, base);
+        tm->tm_sec = strtol(ptr_index, &ptr_index, base);
+    }
+
+    return ret;
 }
 
 /* Func: reset
