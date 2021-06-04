@@ -5,7 +5,7 @@ description: quectel BG9x modem
 
 compatible: "quectel,bg9x"
 
-include: uart-device.yaml
+include: [uart-device.yaml, power.yaml]
 
 properties:
     label:
@@ -24,5 +24,17 @@ properties:
       required: false
 
     mdm-wdisable-gpios:
+      type: phandle-array
+      required: false
+
+    mdm-usb-boot-gpios:
+      type: phandle-array
+      required: false
+
+    mdm-boot-config-gpios:
+      type: phandle-array
+      required: false
+
+    mdm-pon-trig-gpios:
       type: phandle-array
       required: false

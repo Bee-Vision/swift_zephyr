@@ -21,6 +21,10 @@
 
 #include <sys/printk.h>
 
+#if defined(CONFIG_MODEM_QUECTEL_BG9X)
+#include "modem_int.h"
+#endif
+
 struct modem_shell_user_data {
 	const struct shell *shell;
 	void *user_data;
@@ -231,11 +235,85 @@ static int cmd_modem_info(const struct shell *shell, size_t argc, char *argv[])
 	return 0;
 }
 
+static int cmd_modem_on(const struct shell *shell, size_t argc, char *argv[])
+{
+    struct ms_context *mdm_ctx;
+    char *endptr;
+    int i, arg = 1;
+
+    /* info */
+    if (!argv[arg]) {
+        shell_fprintf(shell, SHELL_ERROR,
+                  "Please enter a modem index\n");
+        return -EINVAL;
+    }
+
+    /* <index> of modem receiver */
+    i = (int)strtol(argv[arg], &endptr, 10);
+    if (*endptr != '\0') {
+        shell_fprintf(shell, SHELL_ERROR,
+                  "Please enter a modem index\n");
+        return -EINVAL;
+    }
+
+    mdm_ctx = ms_context_from_id(i);
+    if (!mdm_ctx) {
+        shell_fprintf(shell, SHELL_ERROR, "Modem receiver not found!");
+        return 0;
+    }
+
+#if defined(CONFIG_MODEM_QUECTEL_BG9X)
+    modem_reset();
+#else
+    shell_fprintf(shell, SHELL_ERROR, "Modem does not support power ctrl!");
+#endif
+
+    return 0;
+}
+
+static int cmd_modem_off(const struct shell *shell, size_t argc, char *argv[])
+{
+    struct ms_context *mdm_ctx;
+    char *endptr;
+    int i, arg = 1;
+
+    /* info */
+    if (!argv[arg]) {
+        shell_fprintf(shell, SHELL_ERROR,
+                  "Please enter a modem index\n");
+        return -EINVAL;
+    }
+
+    /* <index> of modem receiver */
+    i = (int)strtol(argv[arg], &endptr, 10);
+    if (*endptr != '\0') {
+        shell_fprintf(shell, SHELL_ERROR,
+                  "Please enter a modem index\n");
+        return -EINVAL;
+    }
+
+    mdm_ctx = ms_context_from_id(i);
+    if (!mdm_ctx) {
+        shell_fprintf(shell, SHELL_ERROR, "Modem receiver not found!");
+        return 0;
+    }
+
+#if defined(CONFIG_MODEM_QUECTEL_BG9X)
+    modem_off();
+#else
+    shell_fprintf(shell, SHELL_ERROR, "Modem does not support power ctrl!");
+#endif
+
+    return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_modem,
 	SHELL_CMD(info, NULL, "Show information for a modem", cmd_modem_info),
 	SHELL_CMD(list, NULL, "List registered modems", cmd_modem_list),
 	SHELL_CMD(send, NULL, "Send an AT <command> to a registered modem "
 			      "receiver", cmd_modem_send),
+	SHELL_CMD(on, NULL, "Power on modem", cmd_modem_on),
+	SHELL_CMD(off, NULL, "Power off modem", cmd_modem_off),
 	SHELL_SUBCMD_SET_END /* Array terminated. */
 );
 

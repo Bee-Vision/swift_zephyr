@@ -58,8 +58,10 @@
 
 /* Hardware timings - Quectel_BG95_Hardware_Design_V1.1.pdf */
 #define MDM_RESET_MIN_VBAT_TIME   K_MSEC(30)
-#define MDM_RESET_ACTIVE_TIME     K_MSEC(2000)
-#define MDM_RESET_UART_INACTIVE_TIME K_MSEC(2500 - 2000) /* Relative to reset assert */
+#define MDM_POWER_ON_TOGGLE_TIME     K_MSEC(2000)
+#define MDM_POWER_ON_PROCEDURE_TIME K_MSEC(2500 - 2000) /* Relative to power/reset assert */
+#define MDM_POWER_DOWN_TOGGLE_TIME K_MSEC(700) /* 650ms - 1500ms */
+#define MDM_POWER_DOWN_PROCEDURE_TIME K_MSEC(1300) /* >= 1.3s */
 
 /* Modem ATOI routine. */
 #define ATOI(s_, value_, desc_)	  modem_atoi(s_, value_, desc_, __func__)
@@ -68,11 +70,23 @@
 enum mdm_control_pins {
 	MDM_POWER = 0,
 	MDM_RESET,
+#if DT_INST_NODE_HAS_PROP(0, mdm_usb_boot_gpios)
+	MDM_USB_BOOT,
+#endif
+#if DT_INST_NODE_HAS_PROP(0, mdm_usb_boot_gpios)
+	MDM_BOOT_CONFIG,
+#endif
+#if DT_INST_NODE_HAS_PROP(0, mdm_pon_trig_gpios)
+	MDM_PON_TRIG,
+#endif
 #if DT_INST_NODE_HAS_PROP(0, mdm_dtr_gpios)
 	MDM_DTR,
 #endif
 #if DT_INST_NODE_HAS_PROP(0, mdm_wdisable_gpios)
 	MDM_WDISABLE,
+#endif
+#if DT_INST_NODE_HAS_PROP(0, supply_gpios)
+	SUPPLY_GPIOS,
 #endif
 };
 
@@ -138,17 +152,46 @@ static struct modem_pin modem_pins[] = {
 		  DT_INST_GPIO_PIN(0, mdm_reset_gpios),
 		  DT_INST_GPIO_FLAGS(0, mdm_reset_gpios) | GPIO_OUTPUT_LOW),
 
+#if DT_INST_NODE_HAS_PROP(0, mdm_usb_boot_gpios)
+	/* MDM_USB_BOOT */
+	MODEM_PIN(DT_INST_GPIO_LABEL(0, mdm_usb_boot_gpios),
+		  DT_INST_GPIO_PIN(0, mdm_usb_boot_gpios),
+		  DT_INST_GPIO_FLAGS(0, mdm_usb_boot_gpios) | GPIO_OUTPUT_LOW),
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, mdm_boot_config_gpios)
+	/* MDM_BOOT_CONFIG */
+	MODEM_PIN(DT_INST_GPIO_LABEL(0, mdm_boot_config_gpios),
+		  DT_INST_GPIO_PIN(0, mdm_boot_config_gpios),
+		  DT_INST_GPIO_FLAGS(0, mdm_boot_config_gpios) | GPIO_OUTPUT_LOW),
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, mdm_pon_trig_gpios)
+	/* MDM_PON_TRIG */
+	MODEM_PIN(DT_INST_GPIO_LABEL(0, mdm_pon_trig_gpios),
+		  DT_INST_GPIO_PIN(0, mdm_pon_trig_gpios),
+		  DT_INST_GPIO_FLAGS(0, mdm_pon_trig_gpios) | GPIO_OUTPUT_LOW),
+#endif
+
 #if DT_INST_NODE_HAS_PROP(0, mdm_dtr_gpios)
 	/* MDM_DTR */
 	MODEM_PIN(DT_INST_GPIO_LABEL(0, mdm_dtr_gpios),
 		  DT_INST_GPIO_PIN(0, mdm_dtr_gpios),
 		  DT_INST_GPIO_FLAGS(0, mdm_dtr_gpios) | GPIO_OUTPUT_LOW),
 #endif
+
 #if DT_INST_NODE_HAS_PROP(0, mdm_wdisable_gpios)
 	/* MDM_WDISABLE */
 	MODEM_PIN(DT_INST_GPIO_LABEL(0, mdm_wdisable_gpios),
 		  DT_INST_GPIO_PIN(0, mdm_wdisable_gpios),
 		  DT_INST_GPIO_FLAGS(0, mdm_wdisable_gpios) | GPIO_OUTPUT_LOW),
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, supply_gpios)
+	/* SUPPLY_GPIOS */
+    MODEM_PIN(DT_INST_GPIO_LABEL(0, supply_gpios),
+          DT_INST_GPIO_PIN(0, supply_gpios),
+          DT_INST_GPIO_FLAGS(0, supply_gpios) | GPIO_OUTPUT_LOW),
 #endif
 };
 

@@ -1120,24 +1120,66 @@ int modem_get_date(struct tm *tm)
 /* Func: reset
  * Desc: Reset the Modem.
  */
-static void modem_reset(void)
+void modem_reset(void)
 {
     /* Power/Reset */
     /* NOTE: Per the BG95 document, the Reset pin is internally connected to the
      * Power key pin. */
 
-    /* VBAT needs to have been stable for not >= MDM_RESET_MIN_VBAT_TIME
+#if DT_INST_NODE_HAS_PROP(0, supply_gpios)
+    /* Enable supply regulator */
+    LOG_INF("Enabling 3.8v supply");
+    modem_pin_write(&mctx, SUPPLY_GPIOS, 1);
+#endif
+
+    /* Set boot option pins */
+#if DT_INST_NODE_HAS_PROP(0, mdm_pon_trig_gpios)
+    LOG_INF("Clearing PSM power-on");
+    modem_pin_write(&mctx, MDM_PON_TRIG, 0);
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, mdm_usb_boot_gpios)
+    LOG_INF("Clearing usb-boot");
+    modem_pin_write(&mctx, MDM_USB_BOOT, 0);
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, mdm_boot_config_gpios)
+    LOG_INF("Clearing boot config");
+    modem_pin_write(&mctx, MDM_BOOT_CONFIG, 0);
+#endif
+
+    /* Set PWR_KEY allow supply to stabilize before toggling */
+    modem_pin_write(&mctx, MDM_POWER, 1);
+
+    /* Supply needs to have been stable for >= MDM_RESET_MIN_VBAT_TIME
      * NOTE: Does not account for stability prior to this point. */
     k_sleep(MDM_RESET_MIN_VBAT_TIME);
 
     /* Reset active asserted for MDM_RESET_N_ACTIVE_TIME */
-    modem_pin_write(&mctx, MDM_RESET, 1);
-    k_sleep(MDM_RESET_ACTIVE_TIME);
+    modem_pin_write(&mctx, MDM_POWER, 0);
+    k_sleep(MDM_POWER_ON_TOGGLE_TIME);
 
-    /* UART is not in an active state until MDM_RESET_N_UART_INACTIVE_TIME time
-     * has elapsed since MDM_RESET_N was cleared. */
-    modem_pin_write(&mctx, MDM_RESET, 0);
-    k_sleep(MDM_RESET_UART_INACTIVE_TIME);
+    /* UART is not in an active state until MDM_POWER_ON_TOGGLE_TIME time
+     * has elapsed since MDM_POWER was toggled. */
+    modem_pin_write(&mctx, MDM_POWER, 1);
+    k_sleep(MDM_POWER_ON_PROCEDURE_TIME);
+}
+
+void modem_off(void)
+{
+    modem_pin_write(&mctx, MDM_POWER, 0);
+    k_sleep(MDM_POWER_DOWN_TOGGLE_TIME);
+
+    /* After PWRKEY has been toggled, it takes time for the BG95 to complete
+     * its shutdown procedure. */
+    modem_pin_write(&mctx, MDM_POWER, 1);
+    k_sleep(MDM_POWER_DOWN_PROCEDURE_TIME);
+
+#if DT_INST_NODE_HAS_PROP(0, supply_gpios)
+    /* Disable supply regulator */
+    LOG_INF("Disabling 3.8v supply");
+    modem_pin_write(&mctx, SUPPLY_GPIOS, 0);
+#endif
 }
 
 /* Func: pin_init

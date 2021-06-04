@@ -9,4 +9,8 @@
 
 int modem_get_date(struct tm *tm);
 
+void modem_reset(void);
+
+void modem_off(void);
+
 #endif /* #ifndef MODEM_INT_H */
