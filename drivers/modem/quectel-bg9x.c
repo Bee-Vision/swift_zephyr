@@ -1117,6 +1117,26 @@ int modem_get_date(struct tm *tm)
     return ret;
 }
 
+int modem_get_info(struct modem_info *info) {
+    BUILD_ASSERT(sizeof(info->manufacturer) <= sizeof(mdata.mdm_manufacturer));
+    memcpy(info->manufacturer, mdata.mdm_manufacturer, sizeof(info->manufacturer));
+    BUILD_ASSERT(sizeof(info->model) <= sizeof(mdata.mdm_model));
+    memcpy(info->model, mdata.mdm_model, sizeof(info->model));
+    BUILD_ASSERT(sizeof(info->revision) <= sizeof(mdata.mdm_revision));
+    memcpy(info->revision, mdata.mdm_revision, sizeof(info->revision));
+    BUILD_ASSERT(sizeof(info->imei) <= sizeof(mdata.mdm_imei));
+    memcpy(info->imei, mdata.mdm_imei, sizeof(info->imei));
+
+#if defined(CONFIG_MODEM_SIM_NUMBERS)
+    BUILD_ASSERT(sizeof(info->imsi) <= sizeof(mdata.mdm_imsi));
+    memcpy(info->imsi, mdata.mdm_imsi, sizeof(info->imsi));
+    BUILD_ASSERT(sizeof(info->iccid) <= sizeof(mdata.mdm_iccid));
+    memcpy(info->iccid, mdata.mdm_iccid, sizeof(info->iccid));
+#endif /* #if defined(CONFIG_MODEM_SIM_NUMBERS) */
+
+    return 0;
+}
+
 /* Func: reset
  * Desc: Reset the Modem.
  */
