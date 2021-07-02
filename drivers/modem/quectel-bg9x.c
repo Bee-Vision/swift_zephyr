@@ -6,9 +6,11 @@
 
 #define DT_DRV_COMPAT quectel_bg9x
 
+#include <string.h>
 #include <logging/log.h>
 LOG_MODULE_REGISTER(modem_quectel_bg9x, CONFIG_MODEM_LOG_LEVEL);
 
+#include "modem_int.h"
 #include "quectel-bg9x.h"
 
 static struct k_thread	       modem_rx_thread;
@@ -135,7 +137,7 @@ static int on_cmd_sockread_common(int socket_fd,
 	struct modem_socket	 *sock = NULL;
 	struct socket_read_data	 *sock_data;
 	int ret, i;
-	int socket_data_length = find_len(data->rx_buf->data);
+	int socket_data_length;
 	int bytes_to_skip;
 
 	if (!len) {
@@ -148,6 +150,8 @@ static int on_cmd_sockread_common(int socket_fd,
 		LOG_ERR("Incorrect format! Ignoring data!");
 		return -EINVAL;
 	}
+
+	socket_data_length = find_len(data->rx_buf->data);
 
 	/* No (or not enough) data available on the socket. */
 	bytes_to_skip = digits(socket_data_length) + 2 + 4;
@@ -210,10 +214,10 @@ exit:
  */
 static void socket_close(struct modem_socket *sock)
 {
-	char buf[sizeof("AT+QICLOSE=##")] = {0};
+	char buf[sizeof("AT+QICLOSE=##,#####")] = {0};
 	int  ret;
 
-	snprintk(buf, sizeof(buf), "AT+QICLOSE=%d", sock->sock_fd);
+	snprintk(buf, sizeof(buf), "AT+QICLOSE=%d,0", sock->sock_fd);
 
 	/* Tell the modem to close the socket. */
 	ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
@@ -405,8 +409,11 @@ MODEM_CMD_DEFINE(on_cmd_unsol_recv)
 {
 	struct modem_socket *sock;
 	int		     sock_fd;
+	int		     new_total;
+	int		     ret;
 
 	sock_fd = ATOI(argv[0], 0, "sock_fd");
+	new_total = ATOI(argv[1], 0, "recv_len");
 
 	/* Socket pointer from FD. */
 	sock = modem_socket_from_fd(&mdata.socket_config, sock_fd);
@@ -414,9 +421,17 @@ MODEM_CMD_DEFINE(on_cmd_unsol_recv)
 		return 0;
 	}
 
-	/* Data ready indication. */
-	LOG_INF("Data Receive Indication for socket: %d", sock_fd);
-	modem_socket_data_ready(&mdata.socket_config, sock);
+	ret = modem_socket_packet_size_update(&mdata.socket_config, sock,
+		new_total);
+	if (ret < 0) {
+		LOG_ERR("socket_id:%d left_bytes:%d err: %d", sock_fd, new_total, ret);
+	}
+
+	if (new_total > 0) {
+		/* Data ready indication. */
+		LOG_INF("Data Receive Indication for socket: %d", sock_fd);
+		modem_socket_data_ready(&mdata.socket_config, sock);
+	}
 
 	return 0;
 }
@@ -441,6 +456,158 @@ MODEM_CMD_DEFINE(on_cmd_unsol_close)
 	return 0;
 }
 
+#if defined(CONFIG_DNS_RESOLVER)
+
+#define MDM_DNS_TIMEOUT                        K_SECONDS(60)
+
+static struct zsock_addrinfo result;
+static struct sockaddr result_addr;
+static char result_canonname[DNS_MAX_NAME_SIZE + 1];
+K_SEM_DEFINE(dns_gip,0,1)
+
+/* Handler: DNS Get IP Indication.
+
+ There are 2 types of messages to be handled by this handler
+
+ Type 1: +QIURC: "dnsgip",<err>,<IP_count>,<DNS_ttl>
+       example: +QIURC: "dnsgip",0,1,299
+
+ Type 2: +QIURC: "dnsgip",<hostIPaddr>]
+       example: +QIURC: "dnsgip","142.250.73.227"
+
+ */
+MODEM_CMD_DEFINE(on_cmd_unsol_dnsgip)
+{
+       /* Assume first arg is IP address if it contains '.'' */
+       char * sptr = strchr(argv[0], '.');
+       if (sptr == NULL)
+       {
+               /* Not IP addr */
+               int dnsgip_err = ATOI(argv[0], 0, "dnsgip_err");
+
+               if (dnsgip_err != 0)
+               {
+                       /* DNS Error, Give the semaphore */
+                       modem_cmd_handler_set_error(data, -EIO);
+                       k_sem_give(&dns_gip);
+               }
+       }
+       else
+       {
+               /* ARGV[0] is IP addr */
+
+               /* chop off end quote */
+               argv[0][strlen(argv[0]) - 1] = '\0';
+
+               /* IPv4 Only */
+               result_addr.sa_family = AF_INET;
+               //skip beginning quote when parsing
+               (void)net_addr_pton(result.ai_family, &argv[0][1],
+                               &((struct sockaddr_in *)&result_addr)->sin_addr);
+
+               modem_cmd_handler_set_error(data, 0);
+               k_sem_give(&dns_gip);
+       }
+
+       return 0;
+}
+
+/* TODO: This is a bare-bones implementation of DNS handling
+ * We ignore most of the hints like ai_family, ai_protocol and ai_socktype.
+ * Later, we can add additional handling if it makes sense.
+ */
+static int offload_getaddrinfo(const char *node, const char *service,
+                              const struct zsock_addrinfo *hints,
+                              struct zsock_addrinfo **res)
+{
+       //struct modem_cmd cmd = MODEM_CMD("+UDNSRN: ", on_cmd_dns, 1U, ",");
+       uint32_t port = 0U;
+       int ret;
+       /* DNS command + 128 bytes for domain name parameter */
+       char sendbuf[sizeof("AT+QIDNSGIP=#,\r\n") + 128];
+
+       /* init result */
+       (void)memset(&result, 0, sizeof(result));
+       (void)memset(&result_addr, 0, sizeof(result_addr));
+       /* FIXME: Hard-code DNS to return only IPv4 */
+       result.ai_family = AF_INET;
+       result_addr.sa_family = AF_INET;
+       result.ai_addr = &result_addr;
+       result.ai_addrlen = sizeof(result_addr);
+       result.ai_canonname = result_canonname;
+       result_canonname[0] = '\0';
+
+       if (service) {
+               port = ATOI(service, 0U, "port");
+               if (port < 1 || port > USHRT_MAX) {
+                       return DNS_EAI_SERVICE;
+               }
+       }
+
+       if (port > 0U) {
+               /* FIXME: DNS is hard-coded to return only IPv4 */
+               if (result.ai_family == AF_INET) {
+                       net_sin(&result_addr)->sin_port = htons(port);
+               }
+       }
+
+       /* check to see if node is an IP address */
+       if (net_addr_pton(result.ai_family, node,
+                         &((struct sockaddr_in *)&result_addr)->sin_addr)
+           == 0) {
+               *res = &result;
+               return 0;
+       }
+
+       /* user flagged node as numeric host, but we failed net_addr_pton */
+       if (hints && hints->ai_flags & AI_NUMERICHOST) {
+               return DNS_EAI_NONAME;
+       }
+
+       k_sem_reset(&dns_gip);
+
+       snprintk(sendbuf, sizeof(sendbuf), "AT+QIDNSGIP=1,\"%s\"", node);
+       ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+                            NULL, 0U, sendbuf, NULL, K_NO_WAIT);
+       if (ret < 0) {
+               return ret;
+       }
+
+       /* Wait for the unsolicited modem response */
+       ret = k_sem_take(&dns_gip, MDM_DNS_TIMEOUT);
+       if (ret == EAGAIN)
+       {
+               /*timed out */
+               return DNS_EAI_FAIL;
+       }
+
+       if ((ret = modem_cmd_handler_get_error(&mdata.cmd_handler_data)) == -EIO)
+       {
+               return DNS_EAI_FAIL;
+       }
+
+       LOG_DBG("DNS RESULT: %s",
+               log_strdup(net_addr_ntop(result.ai_family,
+                                        &net_sin(&result_addr)->sin_addr,
+                                        sendbuf, NET_IPV4_ADDR_LEN)));
+
+       *res = (struct zsock_addrinfo *)&result;
+       return 0;
+}
+
+static void offload_freeaddrinfo(struct zsock_addrinfo *res)
+{
+       /* using static result from offload_getaddrinfo() -- no need to free */
+       res = NULL;
+}
+
+const struct socket_dns_offload offload_dns_ops = {
+       .getaddrinfo = offload_getaddrinfo,
+       .freeaddrinfo = offload_freeaddrinfo,
+};
+
+#endif
+
 /* Func: send_socket_data
  * Desc: This function will send "binary" data over the socket object.
  */
@@ -453,7 +620,6 @@ static ssize_t send_socket_data(struct modem_socket *sock,
 {
 	int  ret;
 	char send_buf[sizeof("AT+QISEND=##,####")] = {0};
-	char ctrlz = 0x1A;
 
 	if (buf_len > MDM_MAX_DATA_LENGTH) {
 		buf_len = MDM_MAX_DATA_LENGTH;
@@ -490,9 +656,8 @@ static ssize_t send_socket_data(struct modem_socket *sock,
 		goto exit;
 	}
 
-	/* Write all data on the console and send CTRL+Z. */
+	/* Write all data on the console */
 	mctx.iface.write(&mctx.iface, buf, buf_len);
-	mctx.iface.write(&mctx.iface, &ctrlz, 1);
 
 	/* Wait for 'SEND OK' or 'SEND FAIL' */
 	k_sem_reset(&mdata.sem_response);
@@ -722,7 +887,7 @@ static int offload_connect(void *obj, const struct sockaddr *addr,
 	uint16_t	    dst_port  = 0;
 	char		    *protocol = "TCP";
 	struct modem_cmd    cmd[]     = { MODEM_CMD("+QIOPEN: ", on_cmd_atcmdinfo_sockopen, 2U, ",") };
-	char		    buf[sizeof("AT+QIOPEN=#,##,###,####.####.####.####,######")] = {0};
+	char		    buf[sizeof("AT+QIOPEN=##,##,q### ########q,q###.###.###.###q,#####,#####,#")] = {0};
 	int		    ret;
 
 	if (sock->id < mdata.socket_config.base_socket_num - 1) {
@@ -900,6 +1065,143 @@ static void modem_rssi_query_work(struct k_work *work)
 	}
 }
 
+static char cclk_result[] = "\"yy/MM/dd,hh:mm:ss-zz\"";
+
+/* Handler: SEND OK */
+MODEM_CMD_DEFINE(on_cmd_atcmd_cclk)
+{
+    modem_cmd_handler_set_error(data, 0);
+    strncpy(cclk_result, argv[0], sizeof(cclk_result)-1);
+    k_sem_give(&mdata.sem_response);
+
+    return 0;
+}
+
+int modem_get_date(struct tm *tm)
+{
+ struct modem_cmd cmd  = MODEM_CMD("+CCLK: ", on_cmd_atcmd_cclk, 1U, "");
+    static char *send_cmd = "AT+CCLK?";
+    int ret;
+
+    /* query modem RSSI */
+    ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+                 &cmd, 1U, send_cmd, &mdata.sem_response,
+                 MDM_CMD_TIMEOUT);
+    if (ret < 0) {
+        LOG_ERR("AT+CCCLK ret:%d", ret);
+    } else {
+        /* Note: Parsing of CCLK response is taken from NCS date_time.c */
+        /* Replace '/' ',' and ':' with whitespace for easier parsing by strtol.
+         * strtol skips over whitespace.
+         */
+        for (int i = 0; i < sizeof(cclk_result); i++) {
+            if (cclk_result[i] == '/' ||
+                    cclk_result[i] == ',' ||
+                    cclk_result[i] == ':') {
+                cclk_result[i] = ' ';
+            }
+        }
+        /* The year starts at index 8. */
+        char *ptr_index = &cclk_result[1];
+        int base = 10;
+        memset(tm, 0, sizeof(*tm));
+
+        tm->tm_year = strtol(ptr_index, &ptr_index, base) + 2000 - 1900;
+        tm->tm_mon = strtol(ptr_index, &ptr_index, base) - 1;
+        tm->tm_mday = strtol(ptr_index, &ptr_index, base);
+        tm->tm_hour = strtol(ptr_index, &ptr_index, base);
+        tm->tm_min = strtol(ptr_index, &ptr_index, base);
+        tm->tm_sec = strtol(ptr_index, &ptr_index, base);
+    }
+
+    return ret;
+}
+
+int modem_get_info(struct modem_info *info) {
+    BUILD_ASSERT(sizeof(info->manufacturer) <= sizeof(mdata.mdm_manufacturer));
+    memcpy(info->manufacturer, mdata.mdm_manufacturer, sizeof(info->manufacturer));
+    BUILD_ASSERT(sizeof(info->model) <= sizeof(mdata.mdm_model));
+    memcpy(info->model, mdata.mdm_model, sizeof(info->model));
+    BUILD_ASSERT(sizeof(info->revision) <= sizeof(mdata.mdm_revision));
+    memcpy(info->revision, mdata.mdm_revision, sizeof(info->revision));
+    BUILD_ASSERT(sizeof(info->imei) <= sizeof(mdata.mdm_imei));
+    memcpy(info->imei, mdata.mdm_imei, sizeof(info->imei));
+
+#if defined(CONFIG_MODEM_SIM_NUMBERS)
+    BUILD_ASSERT(sizeof(info->imsi) <= sizeof(mdata.mdm_imsi));
+    memcpy(info->imsi, mdata.mdm_imsi, sizeof(info->imsi));
+    BUILD_ASSERT(sizeof(info->iccid) <= sizeof(mdata.mdm_iccid));
+    memcpy(info->iccid, mdata.mdm_iccid, sizeof(info->iccid));
+#endif /* #if defined(CONFIG_MODEM_SIM_NUMBERS) */
+
+    return 0;
+}
+
+/* Func: reset
+ * Desc: Reset the Modem.
+ */
+void modem_reset(void)
+{
+    /* Power/Reset */
+    /* NOTE: Per the BG95 document, the Reset pin is internally connected to the
+     * Power key pin. */
+
+#if DT_INST_NODE_HAS_PROP(0, supply_gpios)
+    /* Enable supply regulator */
+    LOG_INF("Enabling 3.8v supply");
+    modem_pin_write(&mctx, SUPPLY_GPIOS, 1);
+#endif
+
+    /* Set boot option pins */
+#if DT_INST_NODE_HAS_PROP(0, mdm_pon_trig_gpios)
+    LOG_INF("Clearing PSM power-on");
+    modem_pin_write(&mctx, MDM_PON_TRIG, 0);
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, mdm_usb_boot_gpios)
+    LOG_INF("Clearing usb-boot");
+    modem_pin_write(&mctx, MDM_USB_BOOT, 0);
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, mdm_boot_config_gpios)
+    LOG_INF("Clearing boot config");
+    modem_pin_write(&mctx, MDM_BOOT_CONFIG, 0);
+#endif
+
+    /* Set PWR_KEY allow supply to stabilize before toggling */
+    modem_pin_write(&mctx, MDM_POWER, 1);
+
+    /* Supply needs to have been stable for >= MDM_RESET_MIN_VBAT_TIME
+     * NOTE: Does not account for stability prior to this point. */
+    k_sleep(MDM_RESET_MIN_VBAT_TIME);
+
+    /* Reset active asserted for MDM_RESET_N_ACTIVE_TIME */
+    modem_pin_write(&mctx, MDM_POWER, 0);
+    k_sleep(MDM_POWER_ON_TOGGLE_TIME);
+
+    /* UART is not in an active state until MDM_POWER_ON_TOGGLE_TIME time
+     * has elapsed since MDM_POWER was toggled. */
+    modem_pin_write(&mctx, MDM_POWER, 1);
+    k_sleep(MDM_POWER_ON_PROCEDURE_TIME);
+}
+
+void modem_off(void)
+{
+    modem_pin_write(&mctx, MDM_POWER, 0);
+    k_sleep(MDM_POWER_DOWN_TOGGLE_TIME);
+
+    /* After PWRKEY has been toggled, it takes time for the BG95 to complete
+     * its shutdown procedure. */
+    modem_pin_write(&mctx, MDM_POWER, 1);
+    k_sleep(MDM_POWER_DOWN_PROCEDURE_TIME);
+
+#if DT_INST_NODE_HAS_PROP(0, supply_gpios)
+    /* Disable supply regulator */
+    LOG_INF("Disabling 3.8v supply");
+    modem_pin_write(&mctx, SUPPLY_GPIOS, 0);
+#endif
+}
+
 /* Func: pin_init
  * Desc: Boot up the Modem.
  */
@@ -907,20 +1209,13 @@ static void pin_init(void)
 {
 	LOG_INF("Setting Modem Pins");
 
-	/* NOTE: Per the BG95 document, the Reset pin is internally connected to the
-	 * Power key pin.
-	 */
+#if DT_INST_NODE_HAS_PROP(0, mdm_wdisable_gpios)
+	LOG_INF("Deactivate W Disable");
+	modem_pin_write(&mctx, MDM_WDISABLE, 0);
+	k_sleep(K_MSEC(250));
+#endif
 
-	/* MDM_POWER -> 1 for 500-1000 msec. */
-	modem_pin_write(&mctx, MDM_POWER, 1);
-	k_sleep(K_MSEC(750));
-
-	/* MDM_POWER -> 0 and wait for ~2secs as UART remains in "inactive" state
-	 * for some time after the power signal is enabled.
-	 */
-	modem_pin_write(&mctx, MDM_POWER, 0);
-	k_sleep(K_SECONDS(2));
-
+	modem_reset();
 	LOG_INF("... Done!");
 }
 
@@ -931,8 +1226,11 @@ static const struct modem_cmd response_cmds[] = {
 };
 
 static const struct modem_cmd unsol_cmds[] = {
-	MODEM_CMD("+QIURC: \"recv\",",	   on_cmd_unsol_recv,  1U, ""),
+	MODEM_CMD("+QIURC: \"recv\",",	   on_cmd_unsol_recv,  2U, ","),
 	MODEM_CMD("+QIURC: \"closed\",",   on_cmd_unsol_close, 1U, ""),
+#if defined(CONFIG_DNS_RESOLVER)
+       MODEM_CMD("+QIURC: \"dnsgip\",",   on_cmd_unsol_dnsgip, 1U, ","),
+#endif
 };
 
 /* Commands sent to the modem to set it up at boot time. */
@@ -950,8 +1248,49 @@ static const struct setup_cmd setup_cmds[] = {
 	SETUP_CMD("AT+CIMI", "", on_cmd_atcmdinfo_imsi, 0U, ""),
 	SETUP_CMD("AT+QCCID", "", on_cmd_atcmdinfo_iccid, 0U, ""),
 #endif /* #if defined(CONFIG_MODEM_SIM_NUMBERS) */
-	SETUP_CMD_NOHANDLE("AT+QICSGP=1,1,\"" MDM_APN "\",\"" MDM_USERNAME "\", \"" MDM_PASSWORD "\",1"),
+	SETUP_CMD_NOHANDLE("AT+QICFG =\"recvind\",1"),
+	SETUP_CMD_NOHANDLE("AT+QICSGP=1,1,\"" MDM_APN "\",\"" MDM_USERNAME "\",\"" MDM_PASSWORD "\",0"),
 };
+
+/* Func: modem_pdp_context_active
+ * Desc: This helper function is called from modem_setup, and is
+ * used to open the PDP context. If there is trouble activating the
+ * PDP context, we try to deactive and reactive MDM_PDP_ACT_RETRY_COUNT times.
+ * If it fails, we return an error.
+ */
+static int modem_pdp_context_activate(void)
+{
+	int ret;
+	int retry_count = 0;
+
+	ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+			     NULL, 0U, "AT+QIACT=1", &mdata.sem_response,
+			     MDM_CMD_TIMEOUT);
+
+	/* If there is trouble activating the PDP context, we try to deactivate/reactive it. */
+	while (ret == -EIO && retry_count < MDM_PDP_ACT_RETRY_COUNT) {
+		ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+			     NULL, 0U, "AT+QIDEACT=1", &mdata.sem_response,
+			     MDM_CMD_TIMEOUT);
+
+		/* If there's any error for AT+QIDEACT, restart the module. */
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+			     NULL, 0U, "AT+QIACT=1", &mdata.sem_response,
+			     MDM_CMD_TIMEOUT);
+
+		retry_count++;
+	}
+
+	if (ret == -EIO && retry_count >= MDM_PDP_ACT_RETRY_COUNT) {
+		LOG_ERR("Retried activating/deactivating too many times.");
+	}
+
+	return ret;
+}
 
 /* Func: modem_setup
  * Desc: This function is used to setup the modem from zero. The idea
@@ -1024,13 +1363,10 @@ restart_rssi:
 				       &mdata.rssi_query_work,
 				       K_SECONDS(RSSI_TIMEOUT_SECS));
 
-	/* Once the network is ready, activate PDP context. */
-	ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
-			     NULL, 0U, "AT+QIACT=1", &mdata.sem_response,
-			     MDM_CMD_TIMEOUT);
-
-	/* Retry or Possibly Exit. */
+	/* Once the network is ready, we try to activate the PDP context. */
+	ret = modem_pdp_context_activate();
 	if (ret < 0 && init_retry_count++ < MDM_INIT_RETRY_COUNT) {
+		LOG_ERR("Error activating modem with pdp context");
 		goto restart;
 	}
 
@@ -1067,6 +1403,10 @@ static void modem_net_iface_init(struct net_if *iface)
 			     sizeof(data->mac_addr),
 			     NET_LINK_ETHERNET);
 	data->net_iface = iface;
+
+#ifdef CONFIG_DNS_RESOLVER
+	socket_offload_dns_register(&offload_dns_ops);
+#endif
 }
 
 static struct net_if_api api_funcs = {
@@ -1173,10 +1513,11 @@ error:
 }
 
 /* Register the device with the Networking stack. */
-NET_DEVICE_OFFLOAD_INIT(modem_gb9x, DT_INST_LABEL(0),
-			modem_init, device_pm_control_nop, &mdata, NULL,
-			CONFIG_MODEM_QUECTEL_BG9X_INIT_PRIORITY, &api_funcs,
-			MDM_MAX_DATA_LENGTH);
+NET_DEVICE_DT_INST_OFFLOAD_DEFINE(0, modem_init, device_pm_control_nop,
+				  &mdata, NULL,
+				  CONFIG_MODEM_QUECTEL_BG9X_INIT_PRIORITY,
+				  &api_funcs, MDM_MAX_DATA_LENGTH);
 
 /* Register NET sockets. */
 NET_SOCKET_REGISTER(quectel_bg9x, AF_UNSPEC, offload_is_supported, offload_socket);
+
